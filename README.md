@@ -9,7 +9,7 @@
 ### 1. 编译项目
 
 ```bash
-go build -o cleandns main.go
+go build -o cleandns .
 ```
 
 ### 2. 配置文件
