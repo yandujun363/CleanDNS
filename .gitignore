@@ -39,5 +39,3 @@ Thumbs.db
 
 # 日志文件
 *.log
-
-build.sh
