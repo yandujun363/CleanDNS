@@ -1,0 +1,23 @@
+{
+  "listen_addr": "0.0.0.0:53",
+  "timeout_seconds": 3,
+  "debug": true,
+  "cache_config": {
+    "enabled": true,
+    "max_size": 10000,
+    "ttl_seconds": 300,
+    "min_ttl_seconds": 1
+  },
+  "udp_upstreams": [
+    "101.101.101.101:53",
+    "1.1.1.1:53",
+    "8.8.8.8:53"
+  ],
+  "dot_upstreams": [
+    "1dot1dot1dot1.cloudflare-dns.com:853"
+  ],
+  "doh_upstreams": [
+    "https://77.88.8.8/dns-query",
+    "https://77.88.8.1/dns-query"
+  ]
+}
