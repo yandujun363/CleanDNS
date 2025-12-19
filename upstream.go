@@ -17,7 +17,10 @@ import (
 // queryUDPUpstream 查询UDP上游（不使用连接池，每个请求独立连接）
 func (p *DNSProxy) queryUDPUpstream(ctx context.Context, msg *dns.Msg, upstream string) *dns.Msg {
 	// 创建新的UDP连接（不使用连接池）
-	conn, err := net.DialTimeout("udp", upstream, p.getTimeout())
+	dialer := &net.Dialer{
+		Timeout: p.getTimeout(),
+	}
+	conn, err := dialer.DialContext(ctx, "udp", upstream)
 	if err != nil {
 		if p.config.Debug {
 			fmt.Printf("连接到UDP上游失败 %s: %v\n", upstream, err)
@@ -37,77 +40,60 @@ func (p *DNSProxy) queryUDPUpstream(ctx context.Context, msg *dns.Msg, upstream 
 	}
 
 	// 接收响应 - 使用足够大的缓冲区
-	buffer := make([]byte, 65535) // UDP最大包大小
-	
-	// 设置总超时
-	deadline := time.Now().Add(p.getTimeout())
+	buffer := make([]byte, 65535)
 	
 	// 收集所有可能的响应
 	var responses []*dns.Msg
 	
-	for time.Now().Before(deadline) {
-		// 设置读取超时
-		conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-		
-		n, err := conn.Read(buffer)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				// 超时，检查是否已经收到有效响应
-				break
-			}
-			// 其他错误，继续等待
-			continue
-		}
-
-		// 尝试解析响应
-		response := new(dns.Msg)
-		if err := response.Unpack(buffer[:n]); err != nil {
-			continue
-		}
-
-		// 检查是否是我们请求的响应
-		if response.Id == msg.Id {
-			responses = append(responses, response)
+	// 持续读取直到超时或上下文被取消
+	for {
+		select {
+		case <-ctx.Done():
+			// 上下文被取消，立即返回
+			return nil
+		default:
+			// 设置较短的读取超时，以便能快速响应上下文取消
+			conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 			
-			// 检查响应是否被截断
-			if response.Truncated {
-				if p.config.Debug {
-					fmt.Printf("UDP响应被截断，回落到安全传输: %s\n", msg.Question[0].Name)
+			n, err := conn.Read(buffer)
+			if err != nil {
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					// 读取超时，继续循环
+					continue
 				}
+				// 其他错误，返回
 				return nil
 			}
-			
-			// 检查是否有OPT记录（EDNS）
-			if hasOPTRecord(response) {
-				if p.config.Debug {
-					fmt.Printf("从 %s 收到EDNS响应: %s\n", upstream, msg.Question[0].Name)
+
+			// 尝试解析响应
+			response := new(dns.Msg)
+			if err := response.Unpack(buffer[:n]); err != nil {
+				continue
+			}
+
+			// 检查是否是我们请求的响应
+			if response.Id == msg.Id {
+				responses = append(responses, response)
+				
+				// 检查响应是否被截断
+				if response.Truncated {
+					if p.config.Debug {
+						fmt.Printf("UDP响应被截断: %s\n", msg.Question[0].Name)
+					}
+					response.Rcode = 0xFF
+					return response
 				}
-				return response
-			}
-			
-			if p.config.Debug {
-				fmt.Printf("从 %s 收到非EDNS响应: %s (继续等待EDNS响应)\n", upstream, msg.Question[0].Name)
+				
+				// 检查是否有OPT记录（EDNS）
+				if hasOPTRecord(response) {
+					if p.config.Debug {
+						fmt.Printf("从 %s 收到EDNS响应: %s\n", upstream, msg.Question[0].Name)
+					}
+					return response
+				}
 			}
 		}
 	}
-	
-	// 如果收到了响应但没有EDNS，检查其他有效性标准
-	for _, response := range responses {
-		if isValidResponse(response) {
-			if p.config.Debug {
-				fmt.Printf("从 %s 收到有效非EDNS响应: %s\n", upstream, msg.Question[0].Name)
-			}
-			return response
-		}
-	}
-	
-	// 如果没有收到任何有效响应
-	if p.config.Debug && len(responses) > 0 {
-		fmt.Printf("从 %s 收到 %d 个响应但都不符合有效性标准: %s\n", 
-			upstream, len(responses), msg.Question[0].Name)
-	}
-	
-	return nil
 }
 
 // queryDOTUpstream 查询DoT上游（使用连接池）
