@@ -250,48 +250,77 @@ func (p *DNSProxy) processRequest(msg *dns.Msg) *dns.Msg {
 		}(upstream)
 	}
 
-	// 等待第一个有效响应
+	// 等待第一个EDNS响应
 	var validResponse *dns.Msg
+	var hasTruncatedResponse bool
 	
-	// 等待所有goroutine完成或超时
-	go func() {
-		wg.Wait()
-		close(responses)
-	}()
+	// 超时控制
+	timeout := time.After(p.getTimeout())
 	
-	// 收集所有响应，优先选择有EDNS的
-	var allResponses []*dns.Msg
-	for resp := range responses {
-		if resp != nil {
-			allResponses = append(allResponses, resp)
-		}
-	}
-	
-	// 首先查找有EDNS的响应
-	for _, resp := range allResponses {
-		if hasOPTRecord(resp) {
-			validResponse = resp
+	// 收集响应，优先选择有EDNS的
+	for i := 0; i < len(p.config.UDPUpstreams); i++ {
+		select {
+		case resp := <-responses:
+			if resp != nil {
+				// 检查是否是截断响应
+				if resp.Rcode == 0xFF {
+					hasTruncatedResponse = true
+					if p.config.Debug {
+						fmt.Printf("收到截断响应，需要回退到安全传输: %s\n", msg.Question[0].Name)
+					}
+					continue
+				}
+				
+				// 首先检查是否是EDNS响应
+				if hasOPTRecord(resp) {
+					validResponse = resp
+					if p.config.Debug {
+						fmt.Printf("从UDP上游获得EDNS响应，立即返回: %s\n", msg.Question[0].Name)
+					}
+					// 取消上下文，停止其他查询
+					cancel()
+					break
+				}
+				// 如果没有EDNS响应，暂时保存
+				if validResponse == nil && isValidResponse(resp) {
+					validResponse = resp
+				}
+			}
+		case <-timeout:
 			if p.config.Debug {
-				fmt.Printf("从UDP上游获得EDNS响应: %s\n", msg.Question[0].Name)
+				fmt.Printf("UDP查询超时: %s\n", msg.Question[0].Name)
 			}
 			break
 		}
-	}
-	
-	// 如果没有EDNS响应，找第一个有效的
-	if validResponse == nil {
-		for _, resp := range allResponses {
-			if isValidResponse(resp) {
-				validResponse = resp
-				if p.config.Debug {
-					fmt.Printf("从UDP上游获得有效响应: %s\n", msg.Question[0].Name)
-				}
-				break
-			}
+		// 如果已经找到EDNS响应，跳出循环
+		if validResponse != nil && hasOPTRecord(validResponse) {
+			break
 		}
 	}
 
-	// 如果从UDP获得了有效响应，直接返回
+	// 如果收到了截断响应，直接回退到安全传输
+	if hasTruncatedResponse {
+		if p.config.Debug {
+			fmt.Printf("有UDP响应被截断，直接回退到安全传输: %s\n", msg.Question[0].Name)
+		}
+		// 取消UDP查询（如果还有在进行的话）
+		cancel()
+		goto fallbackToSecure
+	}
+
+	// 如果找到了EDNS响应，直接返回
+	if validResponse != nil && hasOPTRecord(validResponse) {
+		// 缓存响应
+		if p.config.CacheConfig.Enabled && p.cache != nil {
+			p.cache.Set(msg, validResponse)
+		}
+		// 需要复制消息并设置正确的ID
+		response := validResponse.Copy()
+		response.Id = msg.Id
+		return response
+	}
+	
+	// 如果没有EDNS响应，但有其他有效响应，也返回
 	if validResponse != nil {
 		// 缓存响应
 		if p.config.CacheConfig.Enabled && p.cache != nil {
@@ -303,12 +332,17 @@ func (p *DNSProxy) processRequest(msg *dns.Msg) *dns.Msg {
 		return response
 	}
 
-	// UDP上游没有有效响应，尝试DoT/DoH
+fallbackToSecure:
+	// UDP上游没有有效响应或有截断响应，尝试DoT/DoH
 	if len(p.config.DOTUpstreams) > 0 || len(p.config.DOHUpstreams) > 0 {
 		if p.config.Debug {
-			fmt.Printf("UDP上游无响应，回落到安全传输: %s\n", msg.Question[0].Name)
+			fmt.Printf("回落到安全传输: %s\n", msg.Question[0].Name)
 		}
-		response := p.fallbackToSecureUpstreams(ctx, msg)
+		// 为安全上游创建新的上下文
+		secureCtx, secureCancel := context.WithTimeout(context.Background(), p.getTimeout())
+		defer secureCancel()
+		
+		response := p.fallbackToSecureUpstreams(secureCtx, msg)
 		if response != nil {
 			// 缓存响应
 			if p.config.CacheConfig.Enabled && p.cache != nil {
