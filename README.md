@@ -154,7 +154,7 @@ nslookup example.com 127.0.0.1
 go mod download
 
 # 构建
-go build -o cleandns main.go
+go build -o cleandns .
 
 # 安装到系统路径
 sudo cp cleandns /usr/local/bin/
